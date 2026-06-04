@@ -1,0 +1,185 @@
+version: '3.8'
+
+services:
+
+  # ── Infraestructura ───────────────────────────────────────────────────────
+
+  redis_cache:
+    image: redis:alpine
+    container_name: redis_cache
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 500mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka_init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/init-topics.sh"]
+    volumes:
+      - ./init-topics.sh:/init-topics.sh
+    restart: "no"   # se ejecuta una sola vez y termina
+
+  # ── Servicios T1 ─────────────────────────────────────────────────────────
+
+  sistema_metricas:
+    build: ./sistema_metricas
+    container_name: sistema_metricas
+    ports:
+      - "8001:8000"
+    environment:
+      LOGS_PATH: "/data/metricas.jsonl"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  generador_respuestas:
+    build: ./generador_respuestas
+    container_name: generador_respuestas
+    ports:
+      - "8002:8000"
+    environment:
+      CSV_PATH: "/data/open_buildings_rm.csv"
+      FAILURE_RATE: "0.3"   # cambiar a "0.3" para experimento de reintentos
+      LATENCIA_MS: "0.0"    # cambiar a "500" para experimento de sobrecarga
+    volumes:
+      - ./data:/data
+    depends_on:
+      sistema_metricas:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  sistema_cache:
+    build: ./sistema_cache
+    container_name: sistema_cache
+    ports:
+      - "8003:8000"
+    environment:
+      REDIS_HOST: "redis_cache"
+      URL_RESPUESTAS: "http://generador_respuestas:8000"
+      URL_METRICAS: "http://sistema_metricas:8000"
+      TTL_SEGUNDOS: "60"    # cambiar para experimentos de TTL
+    depends_on:
+      redis_cache:
+        condition: service_healthy
+      generador_respuestas:
+        condition: service_healthy
+      sistema_metricas:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Servicios T2 ─────────────────────────────────────────────────────────
+
+  generador_trafico:
+    build: ./generador_trafico
+    container_name: generador_trafico
+    environment:
+      KAFKA_BROKER: "kafka:9092"
+      TOPIC_PRINCIPAL: "queries"
+      DISTRIBUCION: "zipf"      # cambiar a "uniforme" para ese experimento
+      TIEMPO_ESPERA: "0.1"      # bajar a "0.1" para experimento de spike
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  consumer:
+    build: ./consumer
+    # container_name: consumer
+    environment:
+      KAFKA_BROKER: "kafka:9092"
+      TOPIC_PRINCIPAL: "queries"
+      TOPIC_RETRY: "queries-retry"
+      TOPIC_DLQ: "queries-dlq"
+      GROUP_ID: "processors"
+      MAX_REINTENTOS: "3"
+      URL_CACHE: "http://sistema_cache:8000"
+      URL_METRICAS: "http://sistema_metricas:8000"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      sistema_cache:
+        condition: service_healthy
+    deploy:
+      replicas: 1   # escalar con: docker compose up --scale consumer=3
+
+  retry_consumer:
+    build: ./retry_consumer
+    container_name: retry_consumer
+    environment:
+      KAFKA_BROKER: "kafka:9092"
+      TOPIC_RETRY: "queries-retry"
+      TOPIC_PRINCIPAL: "queries"
+      URL_METRICAS: "http://sistema_metricas:8000"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  # ── Dashboard ─────────────────────────────────────────────────────────────
+
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      URL_METRICAS: "http://sistema_metricas:8000"
+    depends_on:
+      sistema_metricas:
+        condition: service_healthy
